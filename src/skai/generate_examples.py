@@ -67,6 +67,13 @@ class _Coordinate:
   latitude: float
   label: float
 
+  def __post_init__(self):
+    # Check if the longitude and latitude are valid
+    if (not -180 <= self.longitude <= 180) or (not -90 <= self.latitude <= 90):
+      raise ValueError(
+          f'Invalid longitude or latitude, got {self.longitude}, {self.latitude}'
+      )
+
 
 def _to_grayscale(image: np.ndarray) -> np.ndarray:
   return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
@@ -119,12 +126,37 @@ def _get_blank_fraction(data: np.ndarray) -> float:
   return (flattened.size - num_non_blank) / flattened.size
 
 
-def _get_patch_at_coordinate(
-    raster,
-    longitude: float,
-    latitude: float,
-    patch_size: int,
-    resolution: float) -> Optional[np.ndarray]:
+def _get_raster_resolution_in_meters(raster) -> float:
+  """Covert different resolution unit into meters.
+
+  Args:
+    raster: Input raster.
+  Returns:
+    Resolution in meters.
+  Raises:
+    ValueError: CRS error
+  """
+  if raster.res[0] != raster.res[1]:
+    raise ValueError(
+        f'Expecting identical x and y resolutions, got {raster.res[0]}, {raster.res[1]}'
+    )
+  crs = raster.crs
+  try:
+    meter_conversion_factor = crs.linear_units_factor[1]
+  except rasterio.errors.CRSError as e:
+    if crs.to_epsg() == 4326:
+      # Raster resolution is expressed in degrees lon/lat. Convert to
+      # meters with approximation that 1 degree ~ 111km.
+      meter_conversion_factor = 111000
+    else:
+      raise ValueError(
+          f'No linear units factor or unsupported EPSG code, got {e}') from e
+  return raster.res[0] * meter_conversion_factor
+
+
+def _get_patch_at_coordinate(raster, longitude: float, latitude: float,
+                             patch_size: int,
+                             resolution: float) -> Optional[np.ndarray]:
   """Extracts image patch from a raster.
 
   Args:
@@ -145,11 +177,7 @@ def _get_patch_at_coordinate(
   x, y = transformer.transform(longitude, latitude, errcheck=True)
   row, col = raster.index(x, y)
 
-  if raster.res[0] != raster.res[1]:
-    raise ValueError(
-        'Rasters with different x and y resolutions are not supported.')
-
-  raster_res = raster.res[0]
+  raster_res = _get_raster_resolution_in_meters(raster)
   scale_factor = resolution / raster_res
   input_size = int(patch_size * scale_factor)
 
@@ -160,7 +188,10 @@ def _get_patch_at_coordinate(
   # Currently assumes that bands [1, 2, 3] of the input image are the RGB
   # channels.
   window_data = raster.read(
-      indexes=[1, 2, 3], window=window, boundless=True, fill_value=-1,
+      indexes=[1, 2, 3],
+      window=window,
+      boundless=True,
+      fill_value=-1,
       out_shape=(3, patch_size, patch_size))
   if _get_blank_fraction(window_data) > _BLANK_THRESHOLD:
     return None
@@ -168,8 +199,8 @@ def _get_patch_at_coordinate(
   return rasterio.plot.reshape_as_image(window_data)
 
 
-def _create_example(before_image: Image, after_image: Image,
-                    longitude: float, latitude: float, label: float) -> Example:
+def _create_example(before_image: Image, after_image: Image, longitude: float,
+                    latitude: float, label: float) -> Example:
   """Create Tensorflow Example from inputs.
 
   Args:
@@ -242,15 +273,10 @@ class GenerateExamplesFn(beam.DoFn):
     _gdal_env: GDAL environment configuration.
   """
 
-  def __init__(self,
-               before_path: str,
-               after_path: str,
-               generate_labeling_images: bool,
-               example_patch_size: int,
-               alignment_patch_size: int,
-               labeling_patch_size: int,
-               resolution: float,
-               gdal_env: Dict[str, str]) -> None:
+  def __init__(self, before_path: str, after_path: str,
+               generate_labeling_images: bool, example_patch_size: int,
+               alignment_patch_size: int, labeling_patch_size: int,
+               resolution: float, gdal_env: Dict[str, str]) -> None:
     self._before_path = before_path
     self._after_path = after_path
     self._generate_labeling_images = generate_labeling_images
@@ -264,8 +290,8 @@ class GenerateExamplesFn(beam.DoFn):
     self._bad_example_count = Metrics.counter('skai', 'rejected_examples_count')
     self._before_patch_blank_count = Metrics.counter(
         'skai', 'before_patch_blank_count')
-    self._after_patch_blank_count = Metrics.counter(
-        'skai', 'after_patch_blank_count')
+    self._after_patch_blank_count = Metrics.counter('skai',
+                                                    'after_patch_blank_count')
 
   def setup(self) -> None:
     """Open before and after image rasters.
@@ -277,8 +303,8 @@ class GenerateExamplesFn(beam.DoFn):
       self._before_raster = rasterio.open(self._before_path)
       self._after_raster = rasterio.open(self._after_path)
 
-  def process(
-      self, coordinate: _Coordinate) -> Iterator[beam.pvalue.TaggedOutput]:
+  def process(self,
+              coordinate: _Coordinate) -> Iterator[beam.pvalue.TaggedOutput]:
     """Extract patches from before and after images and output as tf Example.
 
     Args:
@@ -302,8 +328,7 @@ class GenerateExamplesFn(beam.DoFn):
       after_patch = _get_patch_at_coordinate(self._after_raster,
                                              coordinate.longitude,
                                              coordinate.latitude,
-                                             after_patch_size,
-                                             self._resolution)
+                                             after_patch_size, self._resolution)
 
       if before_patch is None:
         self._before_patch_blank_count.inc()
@@ -340,8 +365,7 @@ def _get_setup_file_path():
 
 
 def _get_dataflow_pipeline_options(
-    project: str, region: str, temp_dir: str,
-    dataflow_container_image: str,
+    project: str, region: str, temp_dir: str, dataflow_container_image: str,
     worker_service_account: Optional[str]) -> PipelineOptions:
   """Returns dataflow pipeline options.
 
@@ -350,9 +374,9 @@ def _get_dataflow_pipeline_options(
     region: GCP region.
     temp_dir: Temporary data location.
     dataflow_container_image: Docker container to use.
-    worker_service_account: Email of the service account will launch workers.
-        If None, uses the project's default Compute Engine service account
-        (<project-number>-compute@developer.gserviceaccount.com).
+    worker_service_account: Email of the service account will launch workers. If
+      None, uses the project's default Compute Engine service account
+      (<project-number>-compute@developer.gserviceaccount.com).
 
   Returns:
     Dataflow options.
@@ -381,14 +405,9 @@ def _get_local_pipeline_options() -> PipelineOptions:
 
 
 def _generate_examples(
-    before_image_path: str,
-    after_image_path: str,
-    example_patch_size: int,
-    alignment_patch_size: int,
-    labeling_patch_size: int,
-    resolution: float,
-    num_labeling_images: int,
-    gdal_env: Dict[str, str],
+    before_image_path: str, after_image_path: str, example_patch_size: int,
+    alignment_patch_size: int, labeling_patch_size: int, resolution: float,
+    num_labeling_images: int, gdal_env: Dict[str, str],
     coordinates: beam.PCollection,
     stage_prefix: str) -> Tuple[beam.PCollection, beam.PCollection]:
   """Generates examples and labeling images from source images.
@@ -447,7 +466,6 @@ def _write_import_file(output_dir: str,
     output_dir: Output directory. The import file will be written here.
     labeling_images: PCollection of images. Assumes that each record is a tuple
       whose first element is the name of the file relative to the output_dir.
-
   """
   import_file_path = os.path.join(output_dir, 'import_file')
   _ = (
@@ -461,24 +479,20 @@ def _write_import_file(output_dir: str,
           shard_name_template=''))
 
 
-def generate_examples_pipeline(
-    before_image_path: str,
-    after_image_path: str,
-    example_patch_size: int,
-    alignment_patch_size: int,
-    labeling_patch_size: int,
-    resolution: float,
-    output_dir: str,
-    num_output_shards: int,
-    unlabeled_coordinates: List[Tuple[float, float]],
-    labeled_coordinates: List[Tuple[float, float, float]],
-    use_dataflow: bool,
-    num_labeling_images: int,
-    gdal_env: Dict[str, str],
-    dataflow_container_image: Optional[str],
-    cloud_project: Optional[str],
-    cloud_region: Optional[str],
-    worker_service_account: Optional[str]) -> None:
+def generate_examples_pipeline(before_image_path: str, after_image_path: str,
+                               example_patch_size: int,
+                               alignment_patch_size: int,
+                               labeling_patch_size: int, resolution: float,
+                               output_dir: str, num_output_shards: int,
+                               unlabeled_coordinates: List[Tuple[float, float]],
+                               labeled_coordinates: List[Tuple[float, float,
+                                                               float]],
+                               use_dataflow: bool, num_labeling_images: int,
+                               gdal_env: Dict[str, str],
+                               dataflow_container_image: Optional[str],
+                               cloud_project: Optional[str],
+                               cloud_region: Optional[str],
+                               worker_service_account: Optional[str]) -> None:
   """Runs example generation pipeline.
 
   Args:
@@ -560,8 +574,8 @@ def generate_examples_pipeline(
 
       labeled_examples, _ = _generate_examples(
           before_image_path, after_image_path, example_patch_size,
-          alignment_patch_size, labeling_patch_size, resolution, 0,
-          gdal_env, labeled_coordinates_pcollection, 'labeled')
+          alignment_patch_size, labeling_patch_size, resolution, 0, gdal_env,
+          labeled_coordinates_pcollection, 'labeled')
 
       labeled_examples_output_prefix = (
           os.path.join(output_dir, 'examples', 'labeled', 'labeled'))
