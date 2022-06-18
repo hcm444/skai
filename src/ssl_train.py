@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Trains models using semi-supervised learning methods.
+"""Trains models using semi-supervised learning methods.
 
 Creates a dataloder and semi-supervised model. Launches training and/or
 evaluation depending on flags.
